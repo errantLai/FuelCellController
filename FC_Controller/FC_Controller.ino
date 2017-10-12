@@ -6,80 +6,98 @@
 #define FC_ALARM 4
 #define FC_SHUTDOWN 5
 
-// FC Substates
-#define FC_STARTUP_FAN_SPOOLUP 6
-#define FC_STARTUP_STARTUP_PURGE 7
-#define FC_STARTUP_END 8
+// FC Startup Substates
+#define FC_STARTUP_STARTUP_PURGE 6
+#define FC_STARTUP_END 7
 
 // Analog Pins
 #define THEMRMISTOR_PIN 0
-#define PRESSURE_PIN 1
-#define CURRENT_PIN 2
-#define VOLTAGE_PIN 3
+#define CURRENT_PIN 1
+#define VOLTAGE_PIN_ONE 2
+#define VOLTAGE_PIN_TWO 3
 #define HYDROGEN_PIN 4
 
-// Fan States
-#define FAN_OFF 0
-#define FAN_ON_LOW 1
-#define FAN_ON_MED 2
-#define FAN_ON_HIGH 3
-
 // Digital Pins
-#define SYSTEM_ON_PIN 12
-#define PURGE_PIN 2
-#define SUPPLY_PIN 3
-#define RESISTOR_PIN 4
+#define SYSTEM_ON_PIN 2
+#define PURGE_PIN 3
+#define SUPPLY_PIN 4
 #define FC_RELAY_PIN 5
+#define FC_FAN_RELAY_PIN 14
 
-// Valve, Resistor, Relay States (note that this may need to change
+//Digital State LED Pins
+#define STACK_ON_LED 13
+#define STANDBY_LED 12
+#define STARTUP_LED 11
+#define STARTUP_PURGE_LED 10
+#define STARTUP_END_LED 9
+#define RUN_LED 8
+#define SHUTDOWN_LED 7
+#define ALARM_LED 6
+
+// Valve, Relay States (note that this may need to change)
 #define OPEN 0
 #define CLOSED 1
 
 // Other
 #define ARRAY_SIZE 300 // will need to be reduced for testing on an uno
 #define StackTempFixedResistance 10000
-#define FC_MIN_CURRENT 0 // will need to be decided by testing
+
+// Alarm Thresholds TODO: set threshes
+#define FC_MIN_CURRENT 0 // A
+#define FC_MAX_CURRENT 30 // A
+#define FC_STANDBY_MIN_VOLTAGE 0 // V
+#define FC_RUN_MIN_VOLTAGE 13 // V
+#define FC_MAX_VOLTAGE 55 // V
+#define FC_MAX_H2_READ 10 // ppm
+#define FC_MIN_TEMP 15 // deg C
+#define FC_MAX_TEMP 70 // deg C
+
+// Constant System Parameters
+#define PURGE_THRESHOLD 1026.0 //A*s
+#define LOOP_TIME 0.002
+
+// Delays (number of loops @ 2 ms per loop)
+#define STARTUP_PURGE_LOOP_COUNT 500 // 1 s
+#define GENERAL_PURGE_TIME 100 // 0.2 s
+#define STANDBY_DELAY_TIME 1000 // 2 s
+#define SHUTDOWN_DELAY_TIME 1500 // 3 s
+#define START_DELAY_TIME 5000 // 10 s
 
 // flags
 boolean fc_on = false;
 boolean fc_alarm = false;
-boolean fc_fan_time_set = false;
 boolean timer_time_set = false;
 boolean arrays_filled = false;
+boolean fc_purge_time_set = false;
 
-// Program constants, all must be determined with testing
-long FAN_SPOOLUP_TIME = 5000;
-long STARTUP_PURGE_LOOP_COUNT = 5000;
+// global timer 
 unsigned long Current_Time = 0; // would overflow after 25 days if left running forever (hopefully)
-long STANDBY_DELAY_TIME = 5000;
-long SHUTDOWN_DELAY_TIME = 5000;
+
+//purge amp-sec counter
+float AmpSecSincePurge = 0;
+int purge_time = 0;
 
 /*
 ** Counter Declaration
 */
-long fan_start_time = 0;
 long purge_counter = 1;
 long timer_start_time = 0;
 long purgeLastCallTime;
-long secondCounter;
+long fc_on_counter = 0;
+long fc_start_counter = 0;
+long fc_off_counter = 0;
 int arrayIndex = 0;
 
-/* Fake counters*/
-int count = 0;
-unsigned long current_time = 0;
 
-// not sure of the type for this yet
-int CurrentRequest = 0;
-
-int stackTempPos = 0;
+// input value arrays
 int stackTempArray[ARRAY_SIZE];
-int stackPressureArray[ARRAY_SIZE];
 int stackCurrentArray[ARRAY_SIZE];
 int stackVoltageArray[ARRAY_SIZE];
+int stackH2Array[ARRAY_SIZE];
 
-int FC_State = FC_INITIAL; // initial state perhaps we could enumerate these
-int FC_SubState = FC_STARTUP_FAN_SPOOLUP;
-
+// Set up initial states
+int FC_State = FC_INITIAL;
+int FC_SubState = FC_STARTUP_STARTUP_PURGE;
 
 /*
 ** Actual Code
@@ -87,23 +105,24 @@ int FC_SubState = FC_STARTUP_FAN_SPOOLUP;
 **
 */
 
-// Currently, one iteration takes 0.5 ms (3/14/17)
+// Currently, one iteration takes 2 ms (4/29/17)
 void setup() {
   // set all of our variables to their initial values if needed, initiate measuring capabilities as needed
   Serial.begin(115200);
   pinMode(SYSTEM_ON_PIN, INPUT);
   pinMode(PURGE_PIN, OUTPUT);
   pinMode(SUPPLY_PIN, OUTPUT);
-  pinMode(RESISTOR_PIN, OUTPUT);
   pinMode(FC_RELAY_PIN, OUTPUT);
+  pinMode(FC_FAN_RELAY_PIN, OUTPUT);
   delay(100);
-  digitalWrite(PURGE_PIN, CLOSED);
-  digitalWrite(SUPPLY_PIN, CLOSED);
-  digitalWrite(RESISTOR_PIN, OPEN);
-  digitalWrite(FC_RELAY_PIN, OPEN);
+
+  // set valves and relay to default values
+  setAllActuatorsSafe();
   delay(100);
-  setupPins();//remove
-  flashOn();//remove
+
+  // setup LED pins and flash pins to indicate setup complete 
+  setupPins();
+  flashOn();
 }
 
 void loop() {
@@ -111,6 +130,7 @@ void loop() {
   Check_Alarms();
   System();
   FC();
+  delay(1);
 }
 
 
@@ -124,42 +144,52 @@ void Check_Alarms() {
   // Check all alarm properties to make sure they're within the safe range
   // If not, set fc_alarm to true.
   // Temperature, Pressure, Current, Voltage, Hydrogen are checked
+  arrayIndex++;
+  
+  // Take measurements TODO: FIX
+  stackTempArray[arrayIndex] = 20;analogRead(A0);
+  stackCurrentArray[arrayIndex] = 20;analogRead(A1);
+  stackVoltageArray[arrayIndex] = 20;abs(analogRead(A2) - analogRead(A3));
+  stackH2Array[arrayIndex] = analogRead(A4);
 
-  // Take measurements
-  int fc_temp = analogRead(THEMRMISTOR_PIN);
-  int fc_pressure = analogRead(PRESSURE_PIN);
-  int fc_current = analogRead(CURRENT_PIN);
-  int fc_voltage = analogRead(VOLTAGE_PIN);
-  int fc_hydrogen = analogRead(HYDROGEN_PIN);
-
-  if (fc_temp > 500)
-    fc_alarm = true;
-
-  // will need to fill arrays here 
-
-  if (arrayIndex < ARRAY_SIZE || !arrays_filled) {
-    arrayIndex++;
+  if (arrayIndex < ARRAY_SIZE && !arrays_filled) {
     return; // wait until we have enough measurements to start triggering alarms
   }
   else {
-    arrayIndex = 0;
+    arrays_filled = true;
   }
-
-  updateStackTemperature();
-
-
-  // if out of threshhold, set fc_alarm to true
-
+  
+  if (arrayIndex >= ARRAY_SIZE)
+    arrayIndex = 0;
+  
+  // check all thresholds to ensure maxes are not exceeded 
+  checkThreshold(average(stackH2Array), 0, FC_MAX_H2_READ, "HYDROGEN");
+  checkThreshold(Steinhart_Hart(average(stackTempArray)), FC_MIN_TEMP, FC_MAX_TEMP, "TEMPERATURE");
+  checkThreshold(convertToAmperage(average(stackCurrentArray)), FC_MIN_CURRENT, FC_MAX_CURRENT, "CURRENT");
+  
+  if (FC_State == FC_RUN) //TODO: timing may need to be delayed or tweaked to ensure FC voltage is high enough before testing
+    checkThreshold(convertToVoltage(average(stackVoltageArray)), FC_RUN_MIN_VOLTAGE, FC_MAX_VOLTAGE, "VOLTAGE");
+  else
+    checkThreshold(convertToVoltage(average(stackVoltageArray)), FC_STANDBY_MIN_VOLTAGE, FC_MAX_VOLTAGE, "VOLTAGE");
 }
 
+/*
+** Turns the fc on if the on button is help for START_DELAY_TIME
+** 
+*/
 void System() {
-  // wait for input to set fc_on to true, set CurrentRequest
-  Serial.println(digitalRead(SYSTEM_ON_PIN));
-  if (digitalRead(SYSTEM_ON_PIN) == HIGH) {
-    fc_on = true;
+  if (!fc_on || !fc_alarm) {
+    if (digitalRead(SYSTEM_ON_PIN) == HIGH) {
+      fc_on_counter++;
+      if (fc_on_counter >= START_DELAY_TIME) {
+    	digitalWrite(STACK_ON_LED, HIGH);
+    	fc_on = true;
+        fc_on_counter = 0;
+      }
+    }
+    else
+      fc_on_counter = 0;
   }
-
-  CurrentRequest = 0; // need some logic to know how to set CurrentRequest
 }
 
 /* FC()
@@ -172,18 +202,21 @@ void FC() {
   // FSM
   switch (FC_State) {
     case (FC_INITIAL):
-      digitalWrite(13, HIGH);
-      if (count > 1000){
+      setAllActuatorsSafe();
+      
+      fc_start_counter++;
+      Serial.println(fc_start_counter);
+      if (fc_start_counter > 2000) {
         stateTransition(FC_INITIAL, FC_STANDBY);
-        digitalWrite(13, LOW);//remove
-        count = 0;
+        fc_start_counter = 0;
       }
       break;
     case (FC_STANDBY):
       // The stack is not consuming reactant or delivering power
       // and all stack BOP actuators are in their safe state
       // The system remains in FC_STANDBY for STANDBY_DELAY_TIME
-      digitalWrite(11, HIGH);//remove
+      digitalWrite(STANDBY_LED, HIGH);
+      setAllActuatorsSafe();
 
       if (!timer_time_set) {
         timer_start_time = Current_Time;
@@ -194,6 +227,7 @@ void FC() {
       
       if (STANDBY_DELAY_TIME <= Current_Time - timer_start_time && fc_on) {
         timer_time_set = false;
+        digitalWrite(STANDBY_LED, LOW);
         stateTransition(FC_STANDBY, FC_STARTUP);
       }
 
@@ -202,23 +236,36 @@ void FC() {
     case (FC_STARTUP):
       // The stack goes from FC_STANDBY to a state where current can
       // safely be drawn from the stack
-      digitalWrite(10, HIGH);//remove
+      digitalWrite(STARTUP_LED, HIGH);
       FCStartup();
       break;
 
     case (FC_RUN):
       // ?? manual info is copied from FC_STANDBY
-      digitalWrite(9, HIGH);//remove
-      if (!fc_on)
-        stateTransition(FC_RUN, FC_SHUTDOWN);
+      digitalWrite(RUN_LED, HIGH);
+      runStateActuatorStates();
+      
+      // On/off button by driver
+      if (digitalRead(SYSTEM_ON_PIN) == HIGH) {
+        fc_off_counter++;
+        if (fc_off_counter >= START_DELAY_TIME) {
+          digitalWrite(RUN_LED, LOW);
+    	  digitalWrite(STACK_ON_LED, LOW);
+          fc_off_counter = 0;
+          stateTransition(FC_RUN, FC_SHUTDOWN);
+    	  fc_on = false;
+        }
+      }
+      else
+        fc_off_counter = 0;
 
       AutomaticPurgeControl();
-      AutomaticFanControl();
-      StackCurrentRampControl(); // controlled using Current_Request, I would imagine
       break;
 
     case (FC_SHUTDOWN):
-      digitalWrite(8, HIGH);//remove
+      digitalWrite(SHUTDOWN_LED, HIGH);
+      shutdownActuatorStates();
+      
       // The stack goes from FC_RUN to FC_STANDBY. The system remains in
       // FC_SHUTDOWN for SHUTDOWN_DELAY_TIME
       if (!timer_time_set) {
@@ -230,8 +277,10 @@ void FC() {
 
       if (SHUTDOWN_DELAY_TIME <= Current_Time - timer_start_time) {
         timer_time_set = false;
+        digitalWrite(SHUTDOWN_LED, LOW);
         stateTransition(FC_SHUTDOWN, FC_STANDBY);
       }
+      
       break;
 
     case (FC_ALARM):
@@ -241,8 +290,13 @@ void FC() {
       // seems like we need to do some work to make sure everything is in the right state
       // in the event of an alarm... we could specify the alert via a Serial.println if we really
       // wanted but we could also build a visual representation of the system that failed
-      digitalWrite(7, HIGH);//remove
-      Serial.println("AN ALARM HAS BEEN TRIGGERED");
+      digitalWrite(ALARM_LED, HIGH);
+      digitalWrite(STACK_ON_LED, LOW);
+
+      // put valves and relay in safe states
+      setAllActuatorsSafe();
+
+      // we should really have a sound/visual indicator
       break;
 
     default:
@@ -250,16 +304,6 @@ void FC() {
       break;
       
   }
-
-  // eventually can add a delay here depending on what kind of timing resolution we need
-  if (count > 1000){
-    count = 0;
-    Serial.println(FC_State); //remove
-    if (FC_State == FC_STARTUP)
-      Serial.println(FC_SubState);
-    turnAllOff();
-   }
-   count++;
    
    Current_Time++;
 }
@@ -269,7 +313,6 @@ void FC() {
 **
 **
 */
-
 void stateTransition(int fromState, int toState) {
   FC_State = toState;
 }
@@ -284,33 +327,19 @@ void subStateTransition(int fromState, int toState) {
 
 void FCStartup() {
   switch (FC_SubState) {
-    case (FC_STARTUP_FAN_SPOOLUP):
-      // fan is turned on and given time to spool up
-      // TODO: how are we going to implement the fan?
-      if (!fc_fan_time_set) {
-        fan_start_time = Current_Time;
-        fc_fan_time_set = true;
-      }
-      
-      if (FAN_SPOOLUP_TIME <= Current_Time - fan_start_time) {
-        fc_fan_time_set = false;
-        subStateTransition(FC_SubState, FC_STARTUP_STARTUP_PURGE);
-        return;
-      }
-      break;
-
     case (FC_STARTUP_STARTUP_PURGE):
       // purge valve and supply valves are opened simultaneously
-      // for the start-up purge and the start-up resistor is applied
-      // across the stack to limit voltage
-      
-      if (!fc_fan_time_set) {
+      // for the start-up purge across the stack to limit voltage
+      digitalWrite(STARTUP_PURGE_LED, HIGH);
+      startupPurgeActuatorStates();
+      if (!fc_purge_time_set) {
         purge_counter = Current_Time;
-        fc_fan_time_set = true;
+        fc_purge_time_set = true;
       }
 
       if (STARTUP_PURGE_LOOP_COUNT <= Current_Time - purge_counter) {
-        fc_fan_time_set = false;
+        fc_purge_time_set = false;
+        digitalWrite(STARTUP_PURGE_LED, LOW);
         subStateTransition(FC_SubState, FC_STARTUP_END);
         return;
       }
@@ -318,81 +347,86 @@ void FCStartup() {
 
     case (FC_STARTUP_END):
       // close purge valve
-      // fan is minimum
-      fc_fan_time_set = false;
-      purge_counter = 1;
+      startupEndActuatorStates();
+      digitalWrite(STARTUP_END_LED, HIGH);
+      delay(1000);
+      digitalWrite(STARTUP_END_LED, LOW);
+      purge_counter = 0;
+      digitalWrite(STARTUP_LED, LOW);
       stateTransition(FC_State, FC_RUN);
-      subStateTransition(FC_SubState, FC_STARTUP_FAN_SPOOLUP); // switch back to startup purge
+      subStateTransition(FC_SubState, FC_STARTUP_STARTUP_PURGE); // switch back to startup purge
       break;
   }
 }
 
-double Steinhart_Hart(int resistance, double a, double b, double c) {
+/*
+** Conversion Functions TODO: ALL NEED CALIBRATION
+*/
+int convertToAmperage(int val) {
+  return val;
+}
+
+int convertToVoltage(int val) {
+  return val;
+}
+
+int Steinhart_Hart(int val) {
   // Returns the temperature of a thermistor, based on the model's coefficients
   // These double values can be hard coded, or left as inputs for other temp readings
   // In arduino, log() is for the natural log implementation.
-  double logR = log(resistance);
-  double model = a + b * logR + c * (logR * logR * logR);
-  return (1 / model) - 273.15; // Account for Kelvin to Celsius
+  
+  double a = 0; //TODO: calibrate
+  double b = 0;
+  double model = a + b * val;
+  return val;
+  //return int((1 / model) - 273.15); // Account for Kelvin to Celsius
 }
 
 double getStackTemperature() {
-
-  double vTemp = getAverageIntArray(stackTempArray);
+  double vTemp = average(stackTempArray);
   double stackResistance = StackTempFixedResistance * (1023.0 / double(vTemp) - 1.0);
-  return Steinhart_Hart(stackResistance, 1, 1, 1);
+  return Steinhart_Hart(stackResistance);
 }
 
-float AutomaticFanControl() {
-  float OptTemp;
-  float UpdatedFanCmd;
-  //does the fan control thing
-
-  return OptTemp;//, UpdatedFanCmd]; // can't actually do this
-}
-
-boolean AutomaticPurgeControl() {
-  boolean OpenPurgeValve = false;
-
-  return OpenPurgeValve;
+/*
+** Automatic Purge Control
+*/
+void AutomaticPurgeControl() {
+  if (AmpSecSincePurge < PURGE_THRESHOLD) {
+    AmpSecSincePurge = AmpSecSincePurge + LOOP_TIME*stackCurrentArray[arrayIndex];
+    return;
+  }
+  
+  if (purge_time < GENERAL_PURGE_TIME)
+    purge_time++;
+  else {
+    AmpSecSincePurge = 0.0;
+    purge_time = 0;
+  }
 }
 
 /*
 ** This will not be implemented until we better understand how the motor controller works
 */
 
-float StackCurrentRampControl() {
-  float CurrentCmd;
-
-  return CurrentCmd;
-}
-
-void updateStackTemperature() {
-  /* C20
-  Reads the voltage, which is used to approximate the resistance, since the input voltage is
-  the controlled 5V output from the arduino. Steinhart_Hart then used to approximate temperature
-  Expected Input: Voltage from [0, 5V], or [0, 1024)
-  */
-  int vTemp = analogRead(THEMRMISTOR_PIN);
-  stackTempArray[stackTempPos] = vTemp;
-  stackTempPos = int((stackTempPos + 1) % ARRAY_SIZE);
-}
-
-double getAverageIntArray(int* a) {
-  int sizeOfArray = sizeof(a) / sizeof(int);
-  double total = 0;
-  for (int i = 0; i < sizeOfArray; i++) {
-    total += a[i];
-  }
-  return total / sizeOfArray;
-}
-
 int average(int* arr) {
   long sum = 0;
-  for (int i; i < ARRAY_SIZE; i++)
+  for (int i = 0; i < ARRAY_SIZE; i++)
     sum += arr[i];
 
   return sum / ARRAY_SIZE;
+}
+
+void checkThreshold(int input, int lowerLimit, int upperLimit, String inputType) {
+  if (input < lowerLimit)
+    Serial.println("AN ALARM HAS BEEN TRIGGERED DUE TO: LOW " + inputType);
+  else if (input > upperLimit)
+    Serial.println("AN ALARM HAS BEEN TRIGGERED DUE TO: HIGH " + inputType);
+  else
+    return;
+    
+  // if we get here there's an alarm
+  fc_alarm = true;
 }
 
 /*
@@ -405,55 +439,94 @@ void setPurgeState(int state) {
 void setSupplyState(int state) {
   digitalWrite(SUPPLY_PIN, state);
 }
-void setFanState(int state) {
-  // will need to use a switch-case 
-}
 
-void setRelayState(int state) {
+void setMotorRelayState(int state) {
   digitalWrite(FC_RELAY_PIN, state);
 }
 
-void setResistorState(int state) {
-  digitalWrite(RESISTOR_PIN, state);
+void setFanRelayState(int state) {
+  digitalWrite(FC_RELAY_PIN, state);
 }
 
+/*
+** Shortcut Relay/Valve States
+*/
+
+void setAllActuatorsSafe() { // for startup and initial states
+  setPurgeState(LOW); // closed
+  setSupplyState(LOW); // closed
+  setMotorRelayState(LOW); // not connected
+  setFanRelayState(LOW); // not connected
+}
+
+void startupPurgeActuatorStates() { // for startup-purge substate
+  setPurgeState(HIGH); // open
+  setSupplyState(HIGH); // open
+  setMotorRelayState(LOW); // not connected
+  setFanRelayState(LOW); // not connected
+}
+
+void startupEndActuatorStates() { // for startup-end substate
+  setPurgeState(HIGH); // closed
+  setSupplyState(HIGH); // open
+  setMotorRelayState(LOW); // not connected
+  setFanRelayState(HIGH); // connected
+}
+
+void runStateActuatorStates() { // for FC_RUN state
+  // set purge in automatic purge control
+  setSupplyState(HIGH);
+  setMotorRelayState(HIGH);
+  setFanRelayState(HIGH);
+}
+
+void shutdownActuatorStates() { // for FC_SHUTDOWN
+  setPurgeState(HIGH); // open
+  setSupplyState(LOW); // closed
+  setMotorRelayState(LOW); // not connected
+  setFanRelayState(LOW); // not connected
+}
 
 /*
- PHYSICAL OUTPUT TEST REMOVE ALL
+ STATE OUTPUT TEST
 */
 void setupPins() {
-  pinMode(13, OUTPUT);
-  pinMode(11, OUTPUT);
-  pinMode(10, OUTPUT);
-  pinMode(9, OUTPUT);
-  pinMode(8, OUTPUT);
-  pinMode(7, OUTPUT); 
+  pinMode(STACK_ON_LED, OUTPUT);
+  pinMode(STANDBY_LED, OUTPUT);
+  pinMode(STARTUP_LED, OUTPUT);
+  pinMode(STARTUP_PURGE_LED, OUTPUT);
+  pinMode(STARTUP_END_LED, OUTPUT);
+  pinMode(RUN_LED, OUTPUT);
+  pinMode(SHUTDOWN_LED, OUTPUT);
+  pinMode(ALARM_LED, OUTPUT);
+  
+  // wait a bit so everything gets set up internally
   delay(100);
-  digitalWrite(13, LOW);
-  digitalWrite(11, LOW);
-  digitalWrite(10, LOW);
-  digitalWrite(9, LOW);
-  digitalWrite(8, LOW);
-  digitalWrite(7, LOW); 
+  digitalWrite(STACK_ON_LED, LOW); // does not get turned off by turnAllOff()
+  turnAllOff();
 }
 
 void turnAllOff() {
-  digitalWrite(13, LOW);
-  digitalWrite(11, LOW);
-  digitalWrite(10, LOW);
-  digitalWrite(9, LOW);
-  digitalWrite(8, LOW); 
-  digitalWrite(7, LOW); 
+  digitalWrite(STANDBY_LED, LOW);
+  digitalWrite(STARTUP_LED, LOW);
+  digitalWrite(STARTUP_PURGE_LED, LOW);
+  digitalWrite(STARTUP_END_LED, LOW);
+  digitalWrite(RUN_LED, LOW);
+  digitalWrite(SHUTDOWN_LED, LOW);
+  digitalWrite(ALARM_LED, LOW); 
 }
 
 void flashOn() {
-  digitalWrite(13, HIGH);
-  digitalWrite(11, HIGH);
-  digitalWrite(10, HIGH);
-  digitalWrite(9, HIGH);
-  digitalWrite(8, HIGH); 
-  digitalWrite(7, HIGH); 
+  digitalWrite(STACK_ON_LED, HIGH);
+  digitalWrite(STANDBY_LED, HIGH);
+  digitalWrite(STARTUP_LED, HIGH);
+  digitalWrite(STARTUP_PURGE_LED, HIGH);
+  digitalWrite(STARTUP_END_LED, HIGH);
+  digitalWrite(RUN_LED, HIGH);
+  digitalWrite(SHUTDOWN_LED, HIGH);
+  digitalWrite(ALARM_LED, HIGH); 
   delay(1000);
+  digitalWrite(STACK_ON_LED, LOW); // does not get turned off by turnAllOff()
   turnAllOff();
 }
 
